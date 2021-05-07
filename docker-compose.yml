@@ -1,0 +1,146 @@
+version: '3'
+
+services:
+  traefik:
+    image: traefik:latest
+    networks:
+      - ${TRAEFIK_PUBLIC_NETWORK?MISSING}
+      - default
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - traefik-public-cert:/letsencrypt
+    ports:
+      - ${PUBLISHED_TRAEFIK}:80
+      - ${PUBLISHED_TRAEFIK_SECURE}:443
+    command:
+      - --log
+      - --api=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.constraints=Label(`traefik.constraint-label`, `${TRAEFIK_CONSTRAINT?MISSING}`)
+      - --entrypoints.http.address=:80
+      - --entrypoints.http.http.redirections.entryPoint.to=https
+      - --entrypoints.http.http.redirections.entryPoint.scheme=https
+      - --entrypoints.https.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=${EMAIL?MISSING}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=${TRAEFIK_CONSTRAINT?MISSING}
+      - traefik.docker.network=${TRAEFIK_PUBLIC_NETWORK?MISSING}
+      - traefik.http.middlewares.${STACK_NAME?MISSING}-auth.forwardauth.address=http://auth:80/auth/authenticate
+      - traefik.http.middlewares.${STACK_NAME?MISSING}-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.${STACK_NAME?MISSING}-admin-auth.basicauth.users=${DASHBOARD_ID?MISSING}:${DASHBOARD_PW?MISSING}
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.entrypoints=https
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.tls=true
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.tls.certresolver=le
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.rule=Host(`traefik.${DOMAIN?MISSING}`)
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.middlewares=${STACK_NAME?MISSING}-admin-auth
+      - traefik.http.routers.${STACK_NAME?MISSING}-traefik-dashboard.service=api@internal
+  auth:
+    image: ${DOCKER_IMAGE_AUTH?MISSING}:${TAG-latest}
+    volumes:
+      - ./auth/app:/app
+    command:
+      - /start-reload.sh
+    depends_on:
+      - db
+    build:
+      context: ./auth
+      dockerfile: dockerfiles/auth.dockerfile
+    env_file:
+      - .env
+    environment:
+      - SERVER_NAME=${DOMAIN?MISSING}
+      - SERVER_HOST=https://${DOMAIN?MISSING}
+      - POSTGRES_DB=${POSTGRES_DB_AUTH?MISSING}
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=${TRAEFIK_CONSTRAINT?MISSING}
+      - traefik.http.routers.${STACK_NAME?MISSING}-auth.rule=Host(`auth.${DOMAIN?MISSING}`)
+      - traefik.http.routers.${STACK_NAME?MISSING}-auth.entrypoints=https
+      - traefik.http.routers.${STACK_NAME?MISSING}-auth.tls.certresolver=le
+      - traefik.http.routers.${STACK_NAME?MISSING}-auth.service=${STACK_NAME?MISSING}-auth
+      - traefik.http.services.${STACK_NAME?MISSING}-auth.loadbalancer.server.port=80
+  backend:
+    image: ${DOCKER_IMAGE_BACKEND?MISSING}:${TAG-latest}
+    volumes:
+      - ./backend/app:/app
+    command:
+      - /start-reload.sh
+    depends_on:
+      - db
+    build:
+      context: ./backend
+      dockerfile: dockerfiles/backend.dockerfile
+    env_file:
+      - .env
+    environment:
+      - SERVER_NAME=${DOMAIN?MISSING}
+      - SERVER_HOST=https://${DOMAIN?MISSING}
+      - POSTGRES_DB=${POSTGRES_DB_BACKEND?MISSING}
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=${TRAEFIK_CONSTRAINT?MISSING}
+      - traefik.http.routers.${STACK_NAME?MISSING}-backend.rule=Host(`api.${DOMAIN?MISSING}`)
+      - traefik.http.routers.${STACK_NAME?MISSING}-backend.entrypoints=https
+      - traefik.http.routers.${STACK_NAME?MISSING}-backend.tls.certresolver=le
+      - traefik.http.routers.${STACK_NAME?MISSING}-backend.service=${STACK_NAME?MISSING}-backend
+      ### Uncomment for enable forwarded auth
+      # - traefik.http.routers.${STACK_NAME?MISSING}-backend.middlewares=${STACK_NAME?MISSING}-auth
+      - traefik.http.services.${STACK_NAME?MISSING}-backend.loadbalancer.server.port=80
+  frontend:
+    image: ${DOCKER_IMAGE_FRONTEND?MISSING}:${TAG-latest}
+    build:
+      context: ./frontend
+      dockerfile: dockerfiles/frontend.dockerfile
+    stdin_open: true
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=${TRAEFIK_CONSTRAINT?MISSING}
+      - traefik.http.routers.${STACK_NAME?MISSING}-frontend.rule=Host(`${DOMAIN?MISSING}`)
+      - traefik.http.routers.${STACK_NAME?MISSING}-frontend.entrypoints=https
+      - traefik.http.routers.${STACK_NAME?MISSING}-frontend.tls.certresolver=le
+      - traefik.http.routers.${STACK_NAME?MISSING}-frontend.service=${STACK_NAME?MISSING}-frontend
+      - traefik.http.services.${STACK_NAME?MISSING}-frontend.loadbalancer.server.port=3000
+  db:
+    image: postgres:13-alpine
+    volumes:
+      - db-data:/var/lib/postgresql/data/pgdata
+      - ./scripts/db:/docker-entrypoint-initdb.d
+    env_file:
+      - .env
+    environment:
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_MULTIPLE_DATABASES=${POSTGRES_DB_BACKEND},${POSTGRES_DB_AUTH}
+  pgadmin:
+    image: dpage/pgadmin4:5.3
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    networks:
+      - ${TRAEFIK_PUBLIC_NETWORK?MISSING}
+      - default
+    depends_on:
+      - db
+    env_file:
+      - .env
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=${TRAEFIK_CONSTRAINT?MISSING}
+      - traefik.docker.network=${TRAEFIK_PUBLIC_NETWORK?MISSING}
+      - traefik.http.routers.${STACK_NAME?MISSING}-pgadmin-https.rule=Host(`pgadmin.${DOMAIN?MISSING}`)
+      - traefik.http.routers.${STACK_NAME?MISSING}-pgadmin-https.entrypoints=https
+      - traefik.http.routers.${STACK_NAME?MISSING}-pgadmin-https.tls=true
+      - traefik.http.routers.${STACK_NAME?MISSING}-pgadmin-https.tls.certresolver=le
+      - traefik.http.routers.${STACK_NAME?MISSING}-pgadmin.service=${STACK_NAME?MISSING}-pgadmin
+      - traefik.http.services.${STACK_NAME?MISSING}-pgadmin.loadbalancer.server.port=${PGADMIN_LISTEN_PORT?MISSING}
+
+volumes:
+  db-data:
+  pgadmin-data:
+  traefik-public-cert:
+
+networks:
+  traefik-public:
+    external: false
